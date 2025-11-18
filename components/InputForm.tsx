@@ -1,20 +1,37 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { SparklesIcon, UploadIcon, CloseIcon } from './icons';
 
 interface InputFormProps {
     onGenerate: (prompt: string, imageFile: File | null) => void;
     isLoading: boolean;
+    resetKey?: number;
 }
 
-export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) => {
+export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading, resetKey }) => {
     const [prompt, setPrompt] = useState('');
     const [imageFile, setImageFile] = useState<File | null>(null);
     const [imagePreview, setImagePreview] = useState<string | null>(null);
     const [isDragging, setIsDragging] = useState(false);
+    const [uploadError, setUploadError] = useState<string | null>(null);
+    const [inputError, setInputError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const MAX_UPLOAD_SIZE_MB = 10;
 
     const handleFile = (file: File | null) => {
+        if (!file) {
+            setImageFile(null);
+            setImagePreview(null);
+            setUploadError(null);
+            return;
+        }
+
         if (file && file.type.startsWith('image/')) {
+            const fileSizeMb = file.size / (1024 * 1024);
+            if (fileSizeMb > MAX_UPLOAD_SIZE_MB) {
+                setUploadError(`文件大小不能超过 ${MAX_UPLOAD_SIZE_MB}MB。`);
+                return;
+            }
+            setUploadError(null);
             setImageFile(file);
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -22,7 +39,7 @@ export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) =
             };
             reader.readAsDataURL(file);
         } else {
-            // Optional: handle non-image files
+            setUploadError('只能上传图片格式（PNG/JPG/WEBP）。');
             console.warn('Attempted to upload a non-image file.');
         }
     }
@@ -31,43 +48,78 @@ export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) =
         handleFile(e.target.files?.[0] ?? null);
     };
 
-    const handleRemoveImage = (e?: React.MouseEvent) => {
-        e?.stopPropagation();
+    const resetImageState = useCallback(() => {
         setImageFile(null);
         setImagePreview(null);
-        if(fileInputRef.current) {
+        setUploadError(null);
+        if (fileInputRef.current) {
             fileInputRef.current.value = '';
         }
-    }
+    }, []);
+
+    const handleRemoveImage = (e?: React.MouseEvent) => {
+        e?.stopPropagation();
+        resetImageState();
+    };
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        onGenerate(prompt, imageFile);
+        if (isLoading) return;
+        const trimmedPrompt = prompt.trim();
+        if (!trimmedPrompt) {
+            setInputError('Please describe your design concept before generating.');
+            return;
+        }
+        setInputError(null);
+        onGenerate(trimmedPrompt, imageFile);
     };
 
     const handleDragEnter = (e: React.DragEvent) => {
+        if (isLoading) return;
         e.preventDefault();
         e.stopPropagation();
-        setIsDragging(true);
+        if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+            setIsDragging(true);
+        }
     };
     
     const handleDragLeave = (e: React.DragEvent) => {
+        if (isLoading) return;
         e.preventDefault();
         e.stopPropagation();
         setIsDragging(false);
     };
     
     const handleDragOver = (e: React.DragEvent) => {
+        if (isLoading) return;
         e.preventDefault();
         e.stopPropagation();
     };
 
     const handleDrop = (e: React.DragEvent) => {
+        if (isLoading) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
         e.preventDefault();
         e.stopPropagation();
         setIsDragging(false);
         handleFile(e.dataTransfer.files?.[0] ?? null);
     };
+
+    useEffect(() => {
+        if (resetKey === undefined) return;
+        setPrompt('');
+        setInputError(null);
+        resetImageState();
+    }, [resetKey, resetImageState]);
+
+    const dropZoneClasses = [
+        'mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-md transition-colors duration-200',
+        isDragging ? 'border-indigo-500 bg-indigo-50' : 'border-gray-300',
+        isLoading ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:border-indigo-400',
+    ].join(' ');
 
     return (
         <form onSubmit={handleSubmit} className="max-w-2xl mx-auto p-6 bg-white rounded-xl shadow-lg border border-slate-200 space-y-4">
@@ -76,18 +128,26 @@ export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) =
                 <textarea
                     id="prompt"
                     value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
+                    onChange={(e) => {
+                        setPrompt(e.target.value);
+                        if (inputError) {
+                            setInputError(null);
+                        }
+                    }}
                     placeholder="Describe your concept, e.g., 'A mobile app for gardeners,' 'a modern living room,' or 'a cute cartoon water cup'."
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 bg-white text-gray-900 placeholder-gray-400 min-h-[100px]"
                     required
                 />
+                {inputError && (
+                    <p className="text-sm text-red-600 mt-1">{inputError}</p>
+                )}
             </div>
 
             <div className="space-y-2">
                 <label className="block text-sm font-medium text-gray-700">Upload Image (Optional)</label>
-                 <div 
-                    className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-md cursor-pointer transition-colors duration-200 ${isDragging ? 'border-indigo-500 bg-indigo-50' : 'border-gray-300 hover:border-indigo-400'}`}
-                    onClick={() => fileInputRef.current?.click()}
+                <div 
+                    className={dropZoneClasses}
+                    onClick={() => !isLoading && fileInputRef.current?.click()}
                     onDragEnter={handleDragEnter}
                     onDragLeave={handleDragLeave}
                     onDragOver={handleDragOver}
@@ -101,7 +161,7 @@ export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) =
                         <p className="text-xs text-gray-500">PNG, JPG, WEBP up to 10MB</p>
                     </div>
                 </div>
-                 <input
+                <input
                     id="file-upload"
                     ref={fileInputRef}
                     name="file-upload"
@@ -111,7 +171,10 @@ export const InputForm: React.FC<InputFormProps> = ({ onGenerate, isLoading }) =
                     onChange={handleImageChange}
                 />
             </div>
-            
+            {uploadError && (
+                <p className="text-sm text-red-600 mt-1">{uploadError}</p>
+            )}
+           
             {imagePreview && (
                 <div className="flex items-center space-x-4 p-3 bg-slate-50 rounded-lg border">
                      <img src={imagePreview} alt="Image preview" className="w-16 h-16 object-cover rounded-md" />

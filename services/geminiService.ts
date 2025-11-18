@@ -18,37 +18,59 @@ const fileToBase64 = (file: File): Promise<string> =>
     reader.onerror = (error) => reject(error);
   });
 
+const createAbortError = (): Error => {
+    const error = new Error('Request aborted');
+    error.name = 'AbortError';
+    return error;
+};
+
+const throwIfAborted = (signal?: AbortSignal) => {
+    if (signal?.aborted) {
+        throw createAbortError();
+    }
+};
+
+const isAbortError = (error: unknown): error is Error =>
+    error instanceof Error && error.name === 'AbortError';
+
 // Helper function to translate text to English for the image model.
-const translateToEnglish = async (text: string): Promise<string> => {
+const translateToEnglish = async (text: string, signal?: AbortSignal): Promise<string> => {
     // If text is empty or already plain English/ASCII, no need to translate.
     if (!text || !/[^\u0000-\u007F]/.test(text)) {
         return text;
     }
+    throwIfAborted(signal);
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
             contents: `Translate the following text to English for an AI image generation model. Keep core concepts. Output only the translation. Text: "${text}"`,
             config: {
                 temperature: 0,
+                abortSignal: signal,
             }
         });
         return response.text.trim();
     } catch (error) {
+        if (isAbortError(error)) {
+            throw error;
+        }
         console.error("Translation to English failed:", error);
         return text; // Fallback to original text if translation fails
     }
 };
 
 
-export async function* generateDesignAssets(prompt: string, imageFile: File | null): AsyncGenerator<ResultItem> {
+export async function* generateDesignAssets(prompt: string, imageFile: File | null, signal?: AbortSignal): AsyncGenerator<ResultItem> {
+    throwIfAborted(signal);
     
     yield { type: 'status', content: 'Analyzing your design brief...' };
+    throwIfAborted(signal);
     
     // Step 0: Classify the design type
     const classificationResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: `Is the following design request for an 'app', 'website', 'interior design', 'industrial design', or 'other'? Respond with only one of these options. Request: "${prompt}"`,
-        config: { temperature: 0 }
+        config: { temperature: 0, abortSignal: signal }
     });
     const designType = classificationResponse.text.trim().toLowerCase(); // 'app', 'website', 'interior design', 'industrial design', or 'other'
 
@@ -62,6 +84,7 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
         let processedMimeType = imageFile.type;
 
         try {
+            throwIfAborted(signal);
             const options = {
                 maxSizeMB: 1,
                 maxWidthOrHeight: 1024,
@@ -75,6 +98,7 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
             console.error('Image compression failed, using original file.', error);
         }
 
+        throwIfAborted(signal);
         const imageBase64 = await fileToBase64(processedImageFile);
         imagePart = {
             inlineData: { data: imageBase64, mimeType: processedMimeType },
@@ -85,6 +109,7 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
 
     // 1. Generate Design Process Text (in user's language)
     yield { type: 'status', content: 'Brainstorming design process...' };
+    throwIfAborted(signal);
 
     const textGenParts: any[] = [];
     let textGenPrompt = `Create a detailed design process for the following concept: "${prompt}". Include key stages and user interface elements, rooms, or components to be designed. Output as Markdown.`;
@@ -98,11 +123,13 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
     const textResponse = await ai.models.generateContent({
         model: 'gemini-2.5-pro',
         contents: { parts: textGenParts },
+        config: { abortSignal: signal },
     });
     yield { type: 'text', content: textResponse.text };
 
     // 2. Identify Key Screens/Sections/Rooms (in user's language)
     yield { type: 'status', content: 'Identifying key sections for visuals...' };
+    throwIfAborted(signal);
     
     const screenGenParts: any[] = [];
     let itemType = 'screens or sections';
@@ -137,7 +164,8 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
                     }
                 },
                 required: ["items"],
-            }
+            },
+            abortSignal: signal,
         }
     });
 
@@ -181,14 +209,14 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
     }
 
     // Translate the main concept to English once for all image generations.
-    const englishPrompt = await translateToEnglish(prompt);
+    const englishPrompt = await translateToEnglish(prompt, signal);
     
     if (designType === 'industrial design') {
         // --- Sequential generation for product design consistency ---
         let referenceImagePart = imagePart; // Start with user's image, if any
 
         for (const item of itemsToGenerate) {
-            const englishItem = await translateToEnglish(item);
+            const englishItem = await translateToEnglish(item, signal);
             yield { type: 'status', content: `Generating visual for: ${item}...` };
 
             const imageGenParts: any[] = [];
@@ -203,11 +231,13 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
             }
             imageGenParts.push({ text: mockupPrompt });
 
+            throwIfAborted(signal);
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash-image',
                 contents: { parts: imageGenParts },
                 config: {
                     responseModalities: [Modality.IMAGE],
+                    abortSignal: signal,
                 },
             });
 
@@ -228,8 +258,22 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
         }
     } else {
         // --- Parallel generation for other types (apps, websites, etc.) ---
-        const imagePromises = itemsToGenerate.map(async (item) => {
-            const englishItem = await translateToEnglish(item);
+        yield { type: 'status', content: `Generating visuals for: ${itemsToGenerate.join(', ')}...` };
+        throwIfAborted(signal);
+        const MAX_CONCURRENT_IMAGE_REQUESTS = 2;
+        throwIfAborted(signal);
+
+        type ImageTaskResult =
+            | { status: 'fulfilled'; item: string; response: any }
+            | { status: 'rejected'; item: string; reason: unknown };
+
+        let nextIndex = 0;
+        const active = new Set<Promise<ImageTaskResult>>();
+
+        const runItem = async (item: string): Promise<ImageTaskResult> => {
+            throwIfAborted(signal);
+            const englishItem = await translateToEnglish(item, signal);
+            throwIfAborted(signal);
 
             const imageGenParts: any[] = [];
             let mockupPrompt = `Visual for the "${englishItem}" based on the concept: "${englishPrompt}". ${stylePrompt}`;
@@ -245,17 +289,55 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
                 contents: { parts: imageGenParts },
                 config: {
                     responseModalities: [Modality.IMAGE],
+                    abortSignal: signal,
                 },
             });
-            // Return item for alt text and error reporting
-            return { item, response };
-        });
 
-        const imageResults = await Promise.allSettled(imagePromises);
+            return { status: 'fulfilled', item, response };
+        };
 
-        for (const [index, result] of imageResults.entries()) {
-             if (result.status === 'fulfilled') {
-                const { item, response } = result.value;
+        const startNext = () => {
+            if (nextIndex >= itemsToGenerate.length || signal?.aborted) return;
+            const item = itemsToGenerate[nextIndex++];
+            const task = (async () => {
+                try {
+                    return await runItem(item);
+                } catch (error) {
+                    if (isAbortError(error)) {
+                        throw error;
+                    }
+                    return { status: 'rejected', item, reason: error };
+                }
+            })();
+            let tracked: Promise<ImageTaskResult>;
+            tracked = task.finally(() => {
+                active.delete(tracked);
+            });
+            active.add(tracked);
+        };
+
+        while ((nextIndex < itemsToGenerate.length || active.size > 0) && !signal?.aborted) {
+            while (active.size < MAX_CONCURRENT_IMAGE_REQUESTS && nextIndex < itemsToGenerate.length && !signal?.aborted) {
+                startNext();
+            }
+            if (active.size === 0) {
+                break;
+            }
+            let result: ImageTaskResult;
+            try {
+                result = await Promise.race([...active]);
+            } catch (error) {
+                if (isAbortError(error)) {
+                    throw error;
+                }
+                console.error('Unexpected error while generating visuals:', error);
+                continue;
+            }
+            if (signal?.aborted) {
+                break;
+            }
+            if (result.status === 'fulfilled') {
+                const { item, response } = result;
                 const parts = response.candidates?.[0]?.content?.parts ?? [];
                 let imageGenerated = false;
                 for (const part of parts) {
@@ -277,8 +359,8 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
                     };
                 }
             } else {
-                const item = itemsToGenerate[index];
-                console.error(`Failed to generate image for ${item}:`, result.reason);
+                const { item, reason } = result;
+                console.error(`Failed to generate image for ${item}:`, reason);
                 yield { 
                     type: 'text', 
                     content: `**Error:** Could not generate a visual for "${item}". Please try again or adjust your prompt.`,
@@ -289,17 +371,22 @@ export async function* generateDesignAssets(prompt: string, imageFile: File | nu
     }
 }
 
-export async function getChatbotResponse(prompt: string): Promise<string> {
+export async function getChatbotResponse(prompt: string, signal?: AbortSignal): Promise<string> {
+    throwIfAborted(signal);
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
             contents: prompt,
             config: {
                 systemInstruction: "You are a helpful and friendly presentation assistant. You help users brainstorm content for their presentation slides.",
+                abortSignal: signal,
             },
         });
         return response.text;
     } catch (error) {
+        if (isAbortError(error)) {
+            throw error;
+        }
         console.error("Error getting chatbot response:", error);
         return "Sorry, I'm having trouble connecting right now. Please try again in a moment.";
     }

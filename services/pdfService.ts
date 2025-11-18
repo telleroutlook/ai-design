@@ -3,17 +3,48 @@ import type { ResultItem } from '../types';
 // Let TypeScript know jsPDF is available globally
 declare const jspdf: any;
 
+const createAbortError = (): Error => {
+    const error = new Error('Request aborted');
+    error.name = 'AbortError';
+    return error;
+};
+
+const throwIfAborted = (signal?: AbortSignal) => {
+    if (signal?.aborted) {
+        throw createAbortError();
+    }
+};
+
+const isAbortError = (error: unknown): error is Error =>
+    error instanceof Error && error.name === 'AbortError';
+
 // Helper to load an image and return its dimensions
-const getImageDimensions = (src: string): Promise<{ width: number; height: number }> => {
+const getImageDimensions = (src: string, signal?: AbortSignal): Promise<{ width: number; height: number }> => {
     return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(createAbortError());
+            return;
+        }
         const img = new Image();
-        img.onload = () => resolve({ width: img.width, height: img.height });
-        img.onerror = (err) => reject(err);
+        const handleAbort = () => {
+            img.src = '';
+            reject(createAbortError());
+        };
+        signal?.addEventListener('abort', handleAbort, { once: true });
+        img.onload = () => {
+            signal?.removeEventListener('abort', handleAbort);
+            resolve({ width: img.width, height: img.height });
+        };
+        img.onerror = (err) => {
+            signal?.removeEventListener('abort', handleAbort);
+            reject(err);
+        };
         img.src = src;
     });
 };
 
-export const generatePdfFromResults = async (results: ResultItem[], title: string): Promise<void> => {
+export const generatePdfFromResults = async (results: ResultItem[], title: string, signal?: AbortSignal): Promise<void> => {
+    throwIfAborted(signal);
     const { jsPDF } = jspdf;
     const pdf = new jsPDF('p', 'mm', 'a4');
     const FONT_NAME = 'NotoSansCJKjp-Regular';
@@ -46,6 +77,7 @@ export const generatePdfFromResults = async (results: ResultItem[], title: strin
 
 
     for (const item of results) {
+        throwIfAborted(signal);
         if (item.type === 'text') {
             pdf.setFont(FONT_NAME, 'normal'); // Set default font for text blocks
             pdf.setFontSize(12);
@@ -102,12 +134,13 @@ export const generatePdfFromResults = async (results: ResultItem[], title: strin
              cursorY += 5; // Space between text blocks
         } else if (item.type === 'image' && item.content) {
              try {
-                const { width, height } = await getImageDimensions(item.content);
+                const { width, height } = await getImageDimensions(item.content, signal);
+                throwIfAborted(signal);
                 const aspectRatio = width / height;
                 const imgHeight = contentWidth / aspectRatio;
 
                 addNewPageIfNecessary(imgHeight + 15); // Image + alt text
-                
+
                 pdf.addImage(item.content, 'WEBP', margin, cursorY, contentWidth, imgHeight);
                 cursorY += imgHeight + 5;
 
@@ -120,6 +153,9 @@ export const generatePdfFromResults = async (results: ResultItem[], title: strin
                     cursorY += altLines.length * 5 + 10;
                 }
              } catch (error) {
+                if (isAbortError(error)) {
+                    throw error;
+                }
                 console.error("Could not add image to PDF:", error);
                 addNewPageIfNecessary(10);
                 pdf.text('[Image could not be loaded]', margin, cursorY);
@@ -131,6 +167,7 @@ export const generatePdfFromResults = async (results: ResultItem[], title: strin
         }
     }
 
+    throwIfAborted(signal);
     const safeTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '-').substring(0, 50);
     pdf.save(`${safeTitle}-design-package.pdf`);
 };

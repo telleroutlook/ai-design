@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { Header } from './components/Header';
 import { InputForm } from './components/InputForm';
 import { ResultsDisplay } from './components/ResultsDisplay';
@@ -9,6 +9,9 @@ import { generateDesignAssets } from './services/geminiService';
 import { generatePdfFromResults } from './services/pdfService';
 import type { ResultItem } from './types';
 
+const isAbortError = (error: unknown): boolean =>
+    error instanceof Error && error.name === 'AbortError';
+
 const App: React.FC = () => {
     const [results, setResults] = useState<ResultItem[]>([]);
     const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -16,34 +19,55 @@ const App: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [currentPrompt, setCurrentPrompt] = useState<string>('');
     const [isChatbotOpen, setIsChatbotOpen] = useState(false);
+    const [formResetKey, setFormResetKey] = useState(0);
+
+    const designAbortControllerRef = useRef<AbortController | null>(null);
+    const pdfAbortControllerRef = useRef<AbortController | null>(null);
+    const hasClearedResultsRef = useRef(false);
 
     const handleGenerate = useCallback(async (prompt: string, imageFile: File | null) => {
-        if (!prompt) {
+        const trimmedPrompt = prompt.trim();
+        if (!trimmedPrompt) {
             setError('Please provide a design brief or concept.');
             return;
         }
+        const controller = new AbortController();
+        designAbortControllerRef.current?.abort();
+        designAbortControllerRef.current = controller;
+        hasClearedResultsRef.current = false;
         setIsLoading(true);
         setError(null);
-        setResults([]);
-        setCurrentPrompt(prompt);
+        setCurrentPrompt(trimmedPrompt);
         setLoadingMessage('Warming up the design engine...');
 
         try {
-            const stream = generateDesignAssets(prompt, imageFile);
+            const stream = generateDesignAssets(trimmedPrompt, imageFile, controller.signal);
             for await (const result of stream) {
                  if (result.type === 'status') {
                     setLoadingMessage(result.content);
                 } else {
-                    setResults(prev => [...prev, result]);
+                    setResults(prev => {
+                        if (!hasClearedResultsRef.current) {
+                            hasClearedResultsRef.current = true;
+                            return [result];
+                        }
+                        return [...prev, result];
+                    });
                 }
             }
         } catch (err) {
             console.error(err);
+            if (isAbortError(err)) {
+                return;
+            }
             const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
             setError(`An error occurred while generating the design: ${errorMessage}`);
         } finally {
             setIsLoading(false);
             setLoadingMessage('');
+            if (designAbortControllerRef.current?.signal === controller.signal) {
+                designAbortControllerRef.current = null;
+            }
         }
     }, []);
 
@@ -53,24 +77,39 @@ const App: React.FC = () => {
         setIsLoading(true);
         setLoadingMessage('Generating PDF, please wait...');
         setError(null);
+        const controller = new AbortController();
+        pdfAbortControllerRef.current?.abort();
+        pdfAbortControllerRef.current = controller;
 
         try {
-            await generatePdfFromResults(results, currentPrompt || "AI Design Package");
+            await generatePdfFromResults(results, currentPrompt || "AI Design Package", controller.signal);
         } catch (err) {
             console.error(err);
-            const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-            setError(`An error occurred while generating the PDF: ${errorMessage}`);
+            if (!isAbortError(err)) {
+                const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+                setError(`An error occurred while generating the PDF: ${errorMessage}`);
+            }
         } finally {
             setIsLoading(false);
             setLoadingMessage('');
+            if (pdfAbortControllerRef.current?.signal === controller.signal) {
+                pdfAbortControllerRef.current = null;
+            }
         }
     }, [results, currentPrompt]);
 
     const handleReset = useCallback(() => {
+        designAbortControllerRef.current?.abort();
+        pdfAbortControllerRef.current?.abort();
+        designAbortControllerRef.current = null;
+        pdfAbortControllerRef.current = null;
+        hasClearedResultsRef.current = false;
         setResults([]);
         setError(null);
         setCurrentPrompt('');
-        // Note: InputForm state is internal, user can manually clear it.
+        setIsLoading(false);
+        setLoadingMessage('');
+        setFormResetKey(prev => prev + 1);
     }, []);
 
 
@@ -83,7 +122,7 @@ const App: React.FC = () => {
                     <p className="text-slate-600 mb-8">From app mockups to interior renderings. Describe your idea, and let AI bring it to life.</p>
                 </div>
                 
-                <InputForm onGenerate={handleGenerate} isLoading={isLoading} />
+                <InputForm onGenerate={handleGenerate} isLoading={isLoading} resetKey={formResetKey} />
 
                 {error && (
                     <div className="max-w-3xl mx-auto mt-6 p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg">

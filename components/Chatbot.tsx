@@ -12,7 +12,10 @@ export const Chatbot: React.FC<ChatbotProps> = ({ isOpen, onClose }) => {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
+    const [chatError, setChatError] = useState<string | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const inputRef = useRef<HTMLInputElement>(null);
+    const chatAbortControllerRef = useRef<AbortController | null>(null);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -44,22 +47,64 @@ export const Chatbot: React.FC<ChatbotProps> = ({ isOpen, onClose }) => {
         setInput('');
         setIsLoading(true);
 
-        const responseText = await getChatbotResponse(input);
-        
+        let responseText = '';
+        try {
+            setChatError(null);
+            chatAbortControllerRef.current?.abort();
+            const controller = new AbortController();
+            chatAbortControllerRef.current = controller;
+            responseText = await getChatbotResponse(input, controller.signal);
+        } catch (err) {
+            if (err instanceof Error && err.name === 'AbortError') {
+                return;
+            }
+            console.error(err);
+            responseText = "Sorry, I'm having trouble connecting right now. Please try again in a moment.";
+            setChatError('聊天室暂时不可用，请稍后重试。');
+        } finally {
+            setIsLoading(false);
+            chatAbortControllerRef.current = null;
+        }
+
         const modelMessage: ChatMessage = {
             id: (Date.now() + 1).toString(),
             role: 'model',
             text: responseText,
         };
         setMessages(prev => [...prev, modelMessage]);
-        setIsLoading(false);
     };
 
     const handleKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
         if (e.key === 'Enter') {
+            e.preventDefault();
             handleSend();
         }
     };
+    
+    useEffect(() => {
+        if (isOpen) {
+            inputRef.current?.focus();
+        }
+    }, [isOpen]);
+
+    useEffect(() => {
+        if (!isOpen) {
+            chatAbortControllerRef.current?.abort();
+            chatAbortControllerRef.current = null;
+            setIsLoading(false);
+        }
+    }, [isOpen]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        const handleEsc = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                onClose();
+            }
+        };
+        window.addEventListener('keydown', handleEsc);
+        return () => window.removeEventListener('keydown', handleEsc);
+    }, [isOpen, onClose]);
     
     if (!isOpen) return null;
 
@@ -72,7 +117,7 @@ export const Chatbot: React.FC<ChatbotProps> = ({ isOpen, onClose }) => {
                 </button>
             </header>
 
-            <div className="flex-1 p-4 overflow-y-auto bg-slate-50">
+            <div className="flex-1 p-4 overflow-y-auto bg-slate-50" role="log" aria-live="polite">
                 {messages.map(msg => (
                     <div key={msg.id} className={`flex mb-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`py-2 px-4 rounded-2xl max-w-[80%] ${
@@ -84,14 +129,17 @@ export const Chatbot: React.FC<ChatbotProps> = ({ isOpen, onClose }) => {
                         </div>
                     </div>
                 ))}
+                {chatError && (
+                    <p className="text-xs text-red-600 mb-3 px-1">{chatError}</p>
+                )}
                 {isLoading && (
-                     <div className="flex justify-start mb-3">
+                    <div className="flex justify-start mb-3">
                         <div className="py-2 px-4 rounded-2xl bg-gray-200 text-gray-800 rounded-bl-lg">
-                           <div className="flex items-center justify-center gap-1">
-                             <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
-                             <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
-                             <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce"></span>
-                           </div>
+                            <div className="flex items-center justify-center gap-1">
+                                <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                                <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                                <span className="h-2 w-2 bg-gray-400 rounded-full animate-bounce"></span>
+                            </div>
                         </div>
                     </div>
                 )}
@@ -108,6 +156,7 @@ export const Chatbot: React.FC<ChatbotProps> = ({ isOpen, onClose }) => {
                         placeholder="Ask for ideas..."
                         className="flex-1 bg-transparent px-4 py-2 text-sm text-gray-800 placeholder-gray-500 focus:outline-none"
                         disabled={isLoading}
+                        ref={inputRef}
                     />
                     <button onClick={handleSend} disabled={isLoading || input.trim() === ''} className="p-2 text-sky-600 disabled:text-gray-400">
                         <SendIcon />
